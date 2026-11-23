@@ -42,6 +42,8 @@ final class CallClient: NSObject, ObservableObject {
 
     private var task: URLSessionWebSocketTask?
     private var session: URLSession?
+    /// Keeps the tunnel from treating a quiet call as a dead connection.
+    private var heartbeat: Timer?
     private let audio = CallAudio()
     private var scenario = "screening"
 
@@ -88,6 +90,14 @@ final class CallClient: NSObject, ObservableObject {
         audio.onError = { [weak self] msg in
             Task { @MainActor in self?.append(.system, msg) }
         }
+        // Cloudflare closes an idle websocket at roughly 100s. Audio normally
+        // keeps it busy, but the gaps between turns can be long enough to trip
+        // that, so send our own ping.
+        heartbeat?.invalidate()
+        heartbeat = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            self?.task?.sendPing { _ in }
+        }
+
         do {
             try audio.start()
             state = .inCall
@@ -101,6 +111,7 @@ final class CallClient: NSObject, ObservableObject {
     func hangUp() {
         guard state == .inCall || state == .connecting else { return }
         state = .ending
+        heartbeat?.invalidate(); heartbeat = nil
         send(json: ["type": "hangup"])
         audio.stop()
         // Persist locally even if the server summary never arrives.
@@ -126,7 +137,9 @@ final class CallClient: NSObject, ObservableObject {
                 Task { @MainActor in
                     // A cancel during hangup is expected, not a failure.
                     if self.state == .inCall || self.state == .connecting {
-                        self.state = .failed(err.localizedDescription)
+                        self.heartbeat?.invalidate(); self.heartbeat = nil
+                        self.saveRecording()  // keep what we captured
+                        self.state = .failed("Connection dropped: \(err.localizedDescription)")
                         self.audio.stop()
                     }
                 }
@@ -250,8 +263,14 @@ extension CallClient: URLSessionWebSocketDelegate {
                                 didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                                 reason: Data?) {
         Task { @MainActor in
+            self.heartbeat?.invalidate(); self.heartbeat = nil
             self.audio.stop()
-            if self.state == .inCall { self.state = .idle }
+            if self.state == .inCall {
+                // Server-initiated close mid-call: surface it rather than
+                // silently returning to the dial screen.
+                self.saveRecording()
+                self.state = .failed("Server closed the connection (code \(closeCode.rawValue)).")
+            }
         }
     }
 }
