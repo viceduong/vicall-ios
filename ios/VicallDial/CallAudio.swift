@@ -38,6 +38,30 @@ final class CallAudio {
 
     private var converter: AVAudioConverter?
     private(set) var isRunning = false
+    /// True when the hardware echo canceller engaged.
+    private(set) var voiceProcessingActive = false
+
+    /// Suppress the uplink while the bot is speaking.
+    ///
+    /// Belt to the AEC's braces. If voice processing fails to engage — some
+    /// routes and older devices — raw loudspeaker bleed would otherwise reach
+    /// the server, which transcribes the bot's own words as caller speech and
+    /// answers itself. Half-duplex is the honest fallback: we lose the ability
+    /// to interrupt mid-sentence, but the call stays coherent.
+    ///
+    /// When AEC *is* active we keep streaming, because that is what makes
+    /// barge-in work.
+    private let gateLock = NSLock()
+    private var botSpeaking = false
+
+    func setBotSpeaking(_ speaking: Bool) {
+        gateLock.lock(); botSpeaking = speaking; gateLock.unlock()
+    }
+
+    private var shouldMuteUplink: Bool {
+        gateLock.lock(); defer { gateLock.unlock() }
+        return botSpeaking && !voiceProcessingActive
+    }
 
     // Everything the phone hears and says is kept so a call can be replayed
     // and scored offline, which is the whole point of this app.
@@ -51,16 +75,40 @@ final class CallAudio {
         guard !isRunning else { return }
 
         let session = AVAudioSession.sharedInstance()
+        // No .defaultToSpeaker: routing playback to the loudspeaker while the
+        // microphone is live is what makes echo audible in the first place.
+        // The receiver (or a headset) keeps the two far apart, and .voiceChat
+        // already prefers the receiver.
         try session.setCategory(.playAndRecord,
                                 mode: .voiceChat,
-                                options: [.allowBluetooth, .defaultToSpeaker])
+                                options: [.allowBluetooth])
         try session.setPreferredSampleRate(targetRate)
         try session.setPreferredIOBufferDuration(0.02)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
 
         let input = engine.inputNode
-        // The hardware rate is whatever the route gives us (often 48 kHz), so
-        // convert from the node's own format rather than assuming.
+        let output = engine.outputNode
+
+        // The session mode alone does NOT give AVAudioEngine echo cancellation.
+        // Tapping inputNode yields raw microphone audio, loudspeaker bleed
+        // included, which the server then hears as caller speech — the bot ends
+        // up talking to itself. Voice processing is a separate switch on the
+        // nodes, and it must be set BEFORE the engine starts.
+        if #available(iOS 13.0, *) {
+            do {
+                try input.setVoiceProcessingEnabled(true)
+                try output.setVoiceProcessingEnabled(true)
+                voiceProcessingActive = true
+            } catch {
+                // Echo cancellation is unavailable on this route. Say so rather
+                // than silently streaming echo back to the server.
+                voiceProcessingActive = false
+                onError?("Echo cancellation unavailable — use a headset.")
+            }
+        }
+
+        // Read the format AFTER enabling voice processing: turning it on can
+        // change the node's channel count and sample rate.
         let hwFormat = input.outputFormat(forBus: 0)
         guard hwFormat.sampleRate > 0 else {
             throw NSError(domain: "CallAudio", code: 1, userInfo: [
@@ -90,8 +138,15 @@ final class CallAudio {
     func stop() {
         guard isRunning else { return }
         isRunning = false
+        setBotSpeaking(false)
         NotificationCenter.default.removeObserver(self)
         engine.inputNode.removeTap(onBus: 0)
+        // Leave voice processing off for whatever uses the session next.
+        if #available(iOS 13.0, *) {
+            try? engine.inputNode.setVoiceProcessingEnabled(false)
+            try? engine.outputNode.setVoiceProcessingEnabled(false)
+        }
+        voiceProcessingActive = false
         player.stop()
         engine.stop()
         try? AVAudioSession.sharedInstance().setActive(false)
@@ -122,7 +177,14 @@ final class CallAudio {
 
         guard let ch = out.int16ChannelData, out.frameLength > 0 else { return }
         let bytes = Int(out.frameLength) * 2
-        let data = Data(bytes: ch[0], count: bytes)
+        var data = Data(bytes: ch[0], count: bytes)
+
+        // Without AEC, replace the bot's own bleed with silence instead of
+        // dropping the frame: the server's VAD needs a continuous stream to
+        // time its endpointing, and gaps read as the caller having stopped.
+        if shouldMuteUplink {
+            data = Data(count: bytes)
+        }
 
         recLock.lock(); capturedFrames.append(data); recLock.unlock()
         onFrame?(data)

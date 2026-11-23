@@ -161,11 +161,16 @@ final class CallClient: NSObject, ObservableObject {
             if let t = (o["text"] as? String), !t.isEmpty { append(.caller, t) }
 
         case "tts.start":
+            audio.setBotSpeaking(true)
             if let t = o["text"] as? String { append(.bot, t) }
+
+        case "tts.done", "tts.cancelled":
+            audio.setBotSpeaking(false)
 
         case "turn.barge_in":
             // The server stopped talking; drop audio we already queued or the
             // bot keeps speaking locally after being interrupted.
+            audio.setBotSpeaking(false)
             audio.flushPlayback()
             append(.system, "— interrupted —")
 
