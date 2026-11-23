@@ -35,6 +35,31 @@ jobs:
           xcodegen generate --spec project.yml
           ls -la VicallDial.xcodeproj/
 
+      # These compile fine against a modern SDK but do not exist at runtime on
+      # iOS 15, so the app dies on launch with a dyld symbol failure. The
+      # compiler cannot catch it because the deployment target only gates
+      # APIs marked with @available, and SwiftUI modifiers resolve late.
+      # Target device runs 15.6.1, so this is a hard gate.
+      - name: Reject iOS 16+ API usage
+        run: |
+          cd ios
+          BAD=0
+          check() {
+            if grep -rn --include='*.swift' -E "$1" VicallDial \
+                 | grep -vE '^\s*[^:]+:[0-9]+:\s*//'; then
+              echo "  ^^ $2"
+              BAD=1
+            fi
+          }
+          check '\.autocorrectionDisabled\(' 'iOS 16+: use .disableAutocorrection(true)'
+          check '\.monospacedDigit\(\)|Font\.[a-z]+\.monospaced\(\)|\.(caption|body|footnote|headline|title)\.monospaced' \
+                'iOS 16+ Font methods: use .font(.system(_:design:.monospaced))'
+          check 'ShareLink|NavigationStack|ViewThatFits|\bGrid\s*\{|presentationDetents|\.scrollDisabled\(|\.toolbarBackground\(|\.scrollContentBackground\(' \
+                'iOS 16+ view/API'
+          check 'AVAudioApplication' 'iOS 17+: use AVCaptureDevice for mic permission'
+          test "$BAD" -eq 0 || { echo "FATAL: iOS 16+ API found; target device is iOS 15.6.1"; exit 1; }
+          echo "clean: no iOS 16+ APIs"
+
       # Release, not Debug. Xcode 16 Debug builds put the app code in a
       # separate VicallDial.debug.dylib plus __preview.dylib, which a sideloaded
       # unsigned app cannot load — the first build crashed on launch for exactly

@@ -45,13 +45,13 @@ struct DialView: View {
             Section("Server") {
                 TextField("wss://host/ws/call", text: $serverURL)
                     .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
+                    .disableAutocorrection(true)
                     .font(.system(.footnote, design: .monospaced))
                 // Required when the server runs with VICALL_TOKEN set, which it
                 // should whenever it is reachable through the tunnel.
                 SecureField("access token (if required)", text: $token)
                     .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
+                    .disableAutocorrection(true)
                     .font(.system(.footnote, design: .monospaced))
             }
 
@@ -135,7 +135,7 @@ struct DialView: View {
             HStack {
                 if let ms = client.lastResponseMs {
                     Label("\(ms) ms", systemImage: "timer")
-                        .font(.caption.monospacedDigit())
+                        .font(.system(.caption, design: .monospaced))
                         .foregroundColor(ms < 1500 ? .green : .orange)
                 }
                 Spacer()
@@ -160,7 +160,7 @@ struct DialView: View {
             bubble(ev.text, color: .gray.opacity(0.35), align: .leading)
         case .decision:
             Text(ev.text)
-                .font(.caption.monospaced())
+                .font(.system(.caption, design: .monospaced))
                 .foregroundColor(.purple)
                 .frame(maxWidth: .infinity, alignment: .center)
         case .system:
@@ -192,7 +192,7 @@ private struct LabeledRow: View {
         HStack {
             Text(k)
             Spacer()
-            Text(v).foregroundColor(.secondary).font(.body.monospacedDigit())
+            Text(v).foregroundColor(.secondary).font(.system(.body, design: .monospaced))
         }
     }
 }
@@ -217,7 +217,7 @@ struct RecordingsView: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(url.lastPathComponent)
-                                    .font(.footnote.monospaced())
+                                    .font(.system(.footnote, design: .monospaced))
                                     .lineLimit(1)
                                 Text(sizeText(url)).font(.caption2)
                                     .foregroundColor(.secondary)
