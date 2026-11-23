@@ -1,0 +1,69 @@
+name: Build VicallDial (iOS)
+
+# Mirrors the ai-ching pipeline: XcodeGen generates the project, xcodebuild
+# builds unsigned for device, and the .ipa is zipped by hand. No signing, so
+# install with AltStore / Sideloadly.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build VicallDial
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Use default Xcode
+        run: xcode-select -p && xcodebuild -version
+
+      - name: Install XcodeGen
+        run: |
+          curl -sL https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip -o /tmp/xcodegen.zip
+          cd /tmp && unzip -q xcodegen.zip -d xcgen
+          echo "/tmp/xcgen/xcodegen/bin" >> $GITHUB_PATH
+          export PATH="/tmp/xcgen/xcodegen/bin:$PATH"
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: |
+          cd ios
+          xcodegen generate --spec project.yml
+          ls -la VicallDial.xcodeproj/
+
+      - name: Build (device, unsigned)
+        run: |
+          cd ios
+          xcodebuild \
+            -project VicallDial.xcodeproj \
+            -scheme VicallDial \
+            -destination 'generic/platform=iOS' \
+            -configuration Debug \
+            clean build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            PRODUCT_BUNDLE_IDENTIFIER=com.vicall.dial
+
+      - name: Package .ipa
+        run: |
+          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name 'VicallDial.app' -type d -path '*/Debug-iphoneos/*' | head -1)
+          echo "App at: $APP_PATH"
+          test -n "$APP_PATH" || { echo "build product not found"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP_PATH/Info.plist" || true
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr VicallDial.ipa Payload/
+          ls -la VicallDial.ipa
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: VicallDial-ipa
+          path: VicallDial.ipa
+          retention-days: 14

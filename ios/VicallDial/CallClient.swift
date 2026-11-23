@@ -1,0 +1,252 @@
+import Foundation
+
+/// Transcript / event line shown in the in-call view.
+struct CallEvent: Identifiable, Equatable {
+    enum Kind: Equatable { case caller, bot, system, decision }
+    let id = UUID()
+    let kind: Kind
+    let text: String
+    let at: Date
+}
+
+/// Server-reported metrics for one finished call.
+struct CallSummary: Equatable {
+    var callID: String = ""
+    var action: String = ""
+    var intent: String = ""
+    var urgency: Int = 0
+    var turns: Int = 0
+    var durationS: Double = 0
+    var bargeIns: Int = 0
+    var responseP50: Int = 0
+    var responseP95: Int = 0
+}
+
+/// Websocket transport to the vicall server.
+///
+/// Wire protocol: a JSON hello frame opens the call, binary frames are PCM16
+/// audio in both directions, and JSON frames carry pipeline events so the app
+/// can show a live transcript.
+@MainActor
+final class CallClient: NSObject, ObservableObject {
+    @Published var state: State = .idle
+    @Published var events: [CallEvent] = []
+    @Published var partial: String = ""
+    @Published var summary: CallSummary?
+    @Published var lastResponseMs: Int?
+
+    enum State: Equatable {
+        case idle, connecting, inCall, ending
+        case failed(String)
+    }
+
+    private var task: URLSessionWebSocketTask?
+    private var session: URLSession?
+    private let audio = CallAudio()
+    private var scenario = "screening"
+
+    /// Local copy of the call, written when the call ends.
+    private(set) var lastRecordingURL: URL?
+
+    // MARK: - dial
+
+    func dial(urlString: String, scenario: String, token: String = "") {
+        guard state == .idle || isFailed else { return }
+        self.scenario = scenario
+        events.removeAll()
+        partial = ""
+        summary = nil
+        lastResponseMs = nil
+        audio.resetRecording()
+
+        guard let url = URL(string: urlString), url.scheme == "ws" || url.scheme == "wss" else {
+            state = .failed("Bad server URL. Use wss://host/ws/call")
+            return
+        }
+
+        state = .connecting
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 15
+        // The socket must survive a long call with gaps between turns.
+        cfg.timeoutIntervalForResource = 3600
+        let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+        session = s
+        let t = s.webSocketTask(with: url)
+        task = t
+        t.resume()
+        receive()
+
+        // The server requires this when it runs with VICALL_TOKEN set, since the
+        // tunnel exposes the endpoint publicly.
+        var hello: [String: Any] = ["scenario": scenario, "phone": "ios-app"]
+        if !token.isEmpty { hello["token"] = token }
+        send(json: hello)
+
+        audio.onFrame = { [weak self] data in
+            self?.task?.send(.data(data)) { _ in }
+        }
+        audio.onError = { [weak self] msg in
+            Task { @MainActor in self?.append(.system, msg) }
+        }
+        do {
+            try audio.start()
+            state = .inCall
+            append(.system, "Connected — speak when the assistant finishes.")
+        } catch {
+            state = .failed(error.localizedDescription)
+            hangUp()
+        }
+    }
+
+    func hangUp() {
+        guard state == .inCall || state == .connecting else { return }
+        state = .ending
+        send(json: ["type": "hangup"])
+        audio.stop()
+        // Persist locally even if the server summary never arrives.
+        saveRecording()
+        // Give the server a moment to send its summary before tearing down.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            await MainActor.run {
+                self?.task?.cancel(with: .goingAway, reason: nil)
+                self?.task = nil
+                if self?.state == .ending { self?.state = .idle }
+            }
+        }
+    }
+
+    // MARK: - receive
+
+    private func receive() {
+        task?.receive { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let err):
+                Task { @MainActor in
+                    // A cancel during hangup is expected, not a failure.
+                    if self.state == .inCall || self.state == .connecting {
+                        self.state = .failed(err.localizedDescription)
+                        self.audio.stop()
+                    }
+                }
+            case .success(let msg):
+                switch msg {
+                case .data(let d):
+                    self.audio.play(pcm16: d)
+                case .string(let s):
+                    Task { @MainActor in self.handle(json: s) }
+                @unknown default:
+                    break
+                }
+                self.receive()
+            }
+        }
+    }
+
+    private func handle(json: String) {
+        guard let d = json.data(using: .utf8),
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+              let type = o["type"] as? String else { return }
+
+        switch type {
+        case "call_start":
+            if let label = o["label"] as? String { append(.system, label) }
+
+        case "asr.partial":
+            partial = (o["text"] as? String) ?? ""
+
+        case "asr.final":
+            partial = ""
+            if let t = (o["text"] as? String), !t.isEmpty { append(.caller, t) }
+
+        case "tts.start":
+            if let t = o["text"] as? String { append(.bot, t) }
+
+        case "turn.barge_in":
+            // The server stopped talking; drop audio we already queued or the
+            // bot keeps speaking locally after being interrupted.
+            audio.flushPlayback()
+            append(.system, "— interrupted —")
+
+        case "llm.decision":
+            let action = (o["action"] as? String) ?? "?"
+            let intent = (o["intent"] as? String) ?? ""
+            let urg = (o["urgency"] as? Int) ?? 0
+            append(.decision, "action=\(action)  intent=\(intent)  urgency=\(urg)")
+
+        case "cc.handoff":
+            if let r = o["reason"] as? String { append(.system, "override: \(r)") }
+
+        case "tts.first_audio":
+            if let ms = o["ms"] as? Double { lastResponseMs = Int(ms) }
+
+        case "call_summary":
+            var s = CallSummary()
+            s.callID = (o["call_id"] as? String) ?? ""
+            s.action = (o["action"] as? String) ?? ""
+            s.intent = (o["intent"] as? String) ?? ""
+            s.urgency = (o["urgency"] as? Int) ?? 0
+            s.turns = (o["turns"] as? Int) ?? 0
+            s.durationS = (o["duration_s"] as? Double) ?? 0
+            s.bargeIns = (o["barge_ins"] as? Int) ?? 0
+            if let stages = o["stages"] as? [String: Any],
+               let resp = stages["response"] as? [String: Any] {
+                s.responseP50 = (resp["p50_ms"] as? Int) ?? 0
+                s.responseP95 = (resp["p95_ms"] as? Int) ?? 0
+            }
+            summary = s
+            append(.system, "Call ended — \(s.action), \(s.turns) turns")
+
+        case "error":
+            if let m = o["message"] as? String { state = .failed(m) }
+
+        default:
+            break
+        }
+    }
+
+    // MARK: - helpers
+
+    private func append(_ kind: CallEvent.Kind, _ text: String) {
+        events.append(CallEvent(kind: kind, text: text, at: Date()))
+    }
+
+    private func send(json: [String: Any]) {
+        guard let d = try? JSONSerialization.data(withJSONObject: json),
+              let s = String(data: d, encoding: .utf8) else { return }
+        task?.send(.string(s)) { _ in }
+    }
+
+    private func saveRecording() {
+        guard audio.capturedSeconds > 0.5 else { return }
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let url = dir.appendingPathComponent("vicall-\(stamp).wav")
+        do {
+            try audio.writeWav(to: url)
+            lastRecordingURL = url
+            append(.system, "Saved recording: \(url.lastPathComponent)")
+        } catch {
+            append(.system, "Could not save recording: \(error.localizedDescription)")
+        }
+    }
+
+    private var isFailed: Bool {
+        if case .failed = state { return true }
+        return false
+    }
+}
+
+extension CallClient: URLSessionWebSocketDelegate {
+    nonisolated func urlSession(_ session: URLSession,
+                                webSocketTask: URLSessionWebSocketTask,
+                                didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+                                reason: Data?) {
+        Task { @MainActor in
+            self.audio.stop()
+            if self.state == .inCall { self.state = .idle }
+        }
+    }
+}

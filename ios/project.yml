@@ -1,0 +1,29 @@
+name: VicallDial
+options:
+  bundleIdPrefix: com.vicall
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: false
+  generateEmptyDirectories: false
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  VicallDial:
+    type: application
+    platform: iOS
+    sources:
+      - VicallDial
+    info:
+      path: VicallDial/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vicall.dial
+        INFOPLIST_FILE: VicallDial/Info.plist
+        IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    dependencies: []
