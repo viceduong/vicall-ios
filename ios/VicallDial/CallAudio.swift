@@ -22,9 +22,6 @@ final class CallAudio {
     // so the server received a greeting and then zero bytes of microphone audio.
     private var engine = AVAudioEngine()
     private var player = AVAudioPlayerNode()
-    /// Silent sink that gives the input node a downstream path so the engine
-    /// actually pulls from it. Volume 0, so nothing is echoed to the caller.
-    private var captureSink = AVAudioMixerNode()
     private let targetRate: Double = 16_000
 
     /// Capture format: PCM16, mono, 16 kHz — matched to the server.
@@ -135,7 +132,6 @@ final class CallAudio {
         // Discard any previous graph before building a new one.
         engine = AVAudioEngine()
         player = AVAudioPlayerNode()
-        captureSink = AVAudioMixerNode()
         voiceProcessingActive = false
         tapFireCount = 0
         captureDrops = 0
@@ -153,8 +149,14 @@ final class CallAudio {
         try session.setCategory(.playAndRecord,
                                 mode: .voiceChat,
                                 options: [.allowBluetooth])
-        try session.setPreferredSampleRate(targetRate)
-        try session.setPreferredIOBufferDuration(0.02)
+        // Do NOT request a preferred sample rate here. Voice processing runs a
+        // single VPIO unit whose input and output scopes must agree, and
+        // AVAudioIONode.h is explicit: "The output format of the input node and
+        // the input format of the output node have to be the same". Asking for
+        // 16kHz got it granted on input while output stayed at 44.1kHz, which
+        // is an illegal VP graph — the output half started (audio played) and
+        // the input half was never pulled, so the tap never fired. Let VPIO
+        // choose the rate and resample in the tap instead.
         try session.setActive(true, options: .notifyOthersOnDeactivation)
 
         let input = engine.inputNode
@@ -229,22 +231,20 @@ final class CallAudio {
         // microphone audio was ever captured. Pass nil for the format as well
         // and let the node supply its own: an explicit format that disagrees
         // with a voice-processed node is the other way this fails silently.
-        // The input node must be CONNECTED into the graph, not just tapped.
-        // AVAudioEngine only pulls from an input node that has a downstream
-        // path, so a tapped-but-unconnected input never fires its callback —
-        // which is exactly what the device reported: taps=0 while playback
-        // delivered 13 buffers, because the player WAS connected to the mixer.
+        // A tap alone is enough; the input node needs no downstream connection.
+        // My previous attempt routed input -> silenced mixer -> mainMixer, but
+        // mainMixer tracks the OUTPUT format, so that put a sample-rate
+        // conversion inside the input chain. AVAudioInputNode forbids exactly
+        // that: "When rendering from an audio device, the input node does not
+        // support format conversion", and the same rule covers every node in
+        // the input chain. That graph could never start its input half.
         //
-        // Route it through a silenced mixer rather than straight to the main
-        // mixer: connecting the microphone to the output would send the
-        // caller's own voice back at them.
-        engine.attach(captureSink)
-        captureSink.outputVolume = 0
-        engine.connect(input, to: captureSink, format: nil)
-        engine.connect(captureSink, to: engine.mainMixerNode, format: nil)
-
+        // Read the format AFTER enabling voice processing — enabling it changes
+        // the node's rate — and pass it to the tap explicitly, as Apple's own
+        // installTap example does.
+        let tapFormat = input.outputFormat(forBus: 0)
         let bufferSize: AVAudioFrameCount = 4096
-        input.installTap(onBus: 0, bufferSize: bufferSize, format: nil) { [weak self] buf, _ in
+        input.installTap(onBus: 0, bufferSize: bufferSize, format: tapFormat) { [weak self] buf, _ in
             self?.tapFireCount += 1
             self?.handleCapture(buf)
         }
@@ -254,12 +254,20 @@ final class CallAudio {
         player.play()
         isRunning = true
 
+        // A muted VP input gives a running engine with no input callbacks, so
+        // state it rather than inferring it.
+        var vpMuted = false
+        if #available(iOS 13.0, *) { vpMuted = input.isVoiceProcessingInputMuted }
+        let inFmt = input.inputFormat(forBus: 0)
+
         let sess = AVAudioSession.sharedInstance()
         routeInfo = String(
-            format: "in %.0fkHz/%dch · out %.0fkHz · aec %@ · %@",
-            hwFormat.sampleRate / 1000, Int(hwFormat.channelCount),
+            format: "in %.0f/%.0fkHz %dch · out %.0fkHz · aec %@%@ · %@",
+            inFmt.sampleRate / 1000, hwFormat.sampleRate / 1000,
+            Int(hwFormat.channelCount),
             connectFormat.sampleRate / 1000,
             voiceProcessingActive ? "on" : "OFF",
+            vpMuted ? " MUTED" : "",
             sess.currentRoute.outputs.first?.portType.rawValue ?? "?")
 
         // Flush anything the server sent while we were still starting up.
@@ -275,6 +283,13 @@ final class CallAudio {
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleInterruption(_:)),
             name: AVAudioSession.interruptionNotification, object: nil)
+
+        // The engine stops itself when the hardware rate or channel count
+        // changes, and connection formats in an input chain must follow the
+        // hardware. Without this the call simply goes dead mid-conversation.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleConfigChange(_:)),
+            name: .AVAudioEngineConfigurationChange, object: engine)
     }
 
     func stop() {
@@ -501,6 +516,18 @@ final class CallAudio {
     }
 
     // MARK: - interruptions
+
+    @objc private func handleConfigChange(_ note: Notification) {
+        guard isRunning else { return }
+        onError?("Audio route changed — restarting capture.")
+        let wasRunning = isRunning
+        stop()
+        if wasRunning {
+            do { try start() } catch {
+                onError?("Could not restart audio: \(error.localizedDescription)")
+            }
+        }
+    }
 
     @objc private func handleInterruption(_ note: Notification) {
         guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
