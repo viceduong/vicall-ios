@@ -71,7 +71,14 @@ final class CallClient: NSObject, ObservableObject {
 
         state = .connecting
         let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 15
+        // On a websocket URLSession treats this as an INACTIVITY timeout, not
+        // just a handshake deadline. At 15s it was tearing down calls mid-turn:
+        // the socket goes quiet while the bot thinks and speaks, which is
+        // routinely longer than 15s, and iOS killed it as idle. The heartbeat
+        // below is also now faster than this value, so a genuinely quiet call
+        // still gets traffic.
+        cfg.timeoutIntervalForRequest = 300
+        cfg.waitsForConnectivity = true
         // The socket must survive a long call with gaps between turns.
         cfg.timeoutIntervalForResource = 3600
         let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
@@ -100,8 +107,22 @@ final class CallClient: NSObject, ObservableObject {
         // keeps it busy, but the gaps between turns can be long enough to trip
         // that, so send our own ping.
         heartbeat?.invalidate()
-        heartbeat = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-            self?.task?.sendPing { _ in }
+        heartbeat = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
+            guard let self, let task = self.task else { return }
+            task.sendPing { [weak self] err in
+                guard let err else { return }
+                // A failed ping is the earliest reliable signal that the
+                // connection is gone; surface it instead of waiting for a read
+                // to fail much later.
+                Task { @MainActor in
+                    guard let self, self.state == .inCall else { return }
+                    self.heartbeat?.invalidate(); self.heartbeat = nil
+                    self.micWatchdog?.invalidate(); self.micWatchdog = nil
+                    self.saveRecording()
+                    self.state = .failed("Connection lost: \(err.localizedDescription)")
+                    self.audio.stop()
+                }
+            }
         }
 
         // A silently dead microphone used to look like a network problem: the
