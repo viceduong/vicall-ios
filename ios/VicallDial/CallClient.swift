@@ -59,7 +59,8 @@ final class CallClient: NSObject, ObservableObject {
 
     // MARK: - dial
 
-    func dial(urlString: String, scenario: String, token: String = "") {
+    func dial(urlString: String, scenario: String, token: String = "",
+              voiceProcessing: Bool = false) {
         guard state == .idle || isFailed else { return }
         // Settle the microphone permission before opening the socket, so a
         // first run cannot start a call whose audio graph is dead.
@@ -68,6 +69,7 @@ final class CallClient: NSObject, ObservableObject {
             await MainActor.run {
                 guard let self else { return }
                 if ok {
+                    self.audio.useVoiceProcessing = voiceProcessing
                     self.reallyDial(urlString: urlString, scenario: scenario, token: token)
                 } else {
                     self.state = .failed(

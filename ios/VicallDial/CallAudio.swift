@@ -61,6 +61,9 @@ final class CallAudio {
     var tapFireCount = 0
     /// Guards against a self-triggering restart loop.
     private var restarts = 0
+    /// Hardware echo cancellation. Off by default until capture is proven to
+    /// work at all; see the comment at the enable site.
+    var useVoiceProcessing = false
     /// Why capture frames were discarded, if they were.
     private(set) var captureDropReason = ""
     private var captureDrops = 0
@@ -169,7 +172,19 @@ final class CallAudio {
         // included, which the server then hears as caller speech — the bot ends
         // up talking to itself. Voice processing is a separate switch on the
         // nodes, and it must be set BEFORE the engine starts.
-        if #available(iOS 13.0, *) {
+        // Voice processing is now OPT-IN rather than on by default.
+        //
+        // With it on, every documented constraint is satisfied — input and
+        // output both report 48kHz, nothing sits in the input chain, the tap
+        // format comes from the node after enabling, the engine starts and
+        // playback delivers buffers — and the tap still never fires. Eight
+        // theories in, the remaining variable is voice processing itself.
+        //
+        // Without it we lose hardware echo cancellation, so the bot can hear
+        // itself. That is recoverable: the server already gates barge-in on an
+        // RMS threshold and the client mutes its uplink while the bot speaks.
+        // A working call with some echo is worth more than a silent one.
+        if useVoiceProcessing, #available(iOS 13.0, *) {
             do {
                 try input.setVoiceProcessingEnabled(true)
                 try output.setVoiceProcessingEnabled(true)
@@ -327,14 +342,12 @@ final class CallAudio {
     // MARK: - capture
 
     private func handleCapture(_ buf: AVAudioPCMBuffer) {
-        // Voice processing puts the input node at 16kHz, which is already our
-        // wire format. An AVAudioConverter between identical formats is an
-        // identity pass and returns 0 frames through the pull-block API, so the
-        // frameLength > 0 guard below dropped EVERY captured frame — the server
-        // saw zero microphone audio while audio.start reported success.
-        // Diagnostics from the device: "in 16kHz/1ch · out 44kHz".
-        // The tap now supplies its own format, so decide per buffer rather
-        // than trusting what the node reported at setup time.
+        // Decide per buffer rather than trusting the format the node reported
+        // at setup: the rate depends on whether voice processing is enabled and
+        // on the current route. When it already matches the wire format, pass
+        // the frames through — an AVAudioConverter between identical formats is
+        // an identity pass that returns 0 frames through the pull-block API,
+        // which would silently discard everything.
         let f = buf.format
         if f.sampleRate == targetRate && f.channelCount == 1,
            let direct = int16Data(from: buf) {

@@ -7,6 +7,10 @@ struct DialView: View {
     @AppStorage("serverURL") private var serverURL = "wss://your-server.example/ws/call"
     @AppStorage("scenario") private var scenario = "screening"
     @AppStorage("token") private var token = ""
+    // Off by default: with it on, every documented voice-processing constraint
+    // is met and the input tap still never fires, so this is the variable
+    // under test.
+    @AppStorage("voiceProcessing") private var voiceProcessing = false
     @State private var showRecordings = false
 
     private let scenarios: [(id: String, label: String)] = [
@@ -53,6 +57,13 @@ struct DialView: View {
                     .textInputAutocapitalization(.never)
                     .disableAutocorrection(true)
                     .font(.system(.footnote, design: .monospaced))
+                Toggle("Echo cancellation (AEC)", isOn: $voiceProcessing)
+                    .font(.footnote)
+                Text(voiceProcessing
+                     ? "On: no echo, but capture is currently failing this way."
+                     : "Off: capture should work; the bot may hear itself.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
 
             Section("Scenario") {
@@ -108,7 +119,8 @@ struct DialView: View {
 
             Section {
                 Button {
-                    client.dial(urlString: serverURL, scenario: scenario, token: token)
+                    client.dial(urlString: serverURL, scenario: scenario,
+                                token: token, voiceProcessing: voiceProcessing)
                 } label: {
                     HStack {
                         Spacer()
