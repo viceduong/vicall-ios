@@ -71,6 +71,27 @@ struct DialView: View {
                 }
             }
 
+            // Shown on the dial screen on purpose. A failed call returns here
+            // and discards the transcript, so in-call diagnostics were never
+            // readable — which cost several rounds of blind guessing.
+            if !client.diagnostics.isEmpty {
+                Section("Audio diagnostics") {
+                    ForEach(Array(client.diagnostics.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    Button {
+                        UIPasteboard.general.string =
+                            client.diagnostics.joined(separator: "\n")
+                    } label: {
+                        Label("Copy diagnostics", systemImage: "doc.on.doc")
+                            .font(.footnote)
+                    }
+                }
+            }
+
             if let s = client.summary {
                 Section("Last call") {
                     LabeledRow("Action", s.action)

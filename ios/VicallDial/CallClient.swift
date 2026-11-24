@@ -34,6 +34,10 @@ final class CallClient: NSObject, ObservableObject {
     @Published var partial: String = ""
     @Published var summary: CallSummary?
     @Published var lastResponseMs: Int?
+    /// Survives a failed call so the cause is still readable afterwards.
+    /// A .failed state returns the UI to the dial screen and discards `events`,
+    /// which is why five rounds of audio diagnostics were never seen.
+    @Published var diagnostics: [String] = []
 
     enum State: Equatable {
         case idle, connecting, inCall, ending
@@ -116,8 +120,12 @@ final class CallClient: NSObject, ObservableObject {
         // sometimes silent. Ordering it this way removes the race entirely.
         do {
             try audio.start()
+            diag("audio.start OK — \(audio.routeInfo)")
         } catch {
-            state = .failed(error.localizedDescription)
+            // This was invisible before: .failed swaps the view back to the
+            // dial screen and the transcript goes with it.
+            diag("audio.start FAILED: \(error.localizedDescription)")
+            state = .failed("Audio failed: \(error.localizedDescription)")
             task?.cancel(with: .goingAway, reason: nil)
             task = nil
             return
@@ -183,9 +191,11 @@ final class CallClient: NSObject, ObservableObject {
             await MainActor.run {
                 guard let self, self.state == .inCall else { return }
                 let n = self.audio.playedBufferCount
-                self.append(.system, n == 0
-                    ? "No bot audio reached the speaker (0 buffers) — audio graph problem."
-                    : "Playback OK (\(n) buffers).")
+                let msg = n == 0
+                    ? "0 playback buffers — graph dead. \(self.audio.routeInfo)"
+                    : "Playback OK: \(n) buffers, \(self.framesSent) mic frames sent."
+                self.append(.system, msg)
+                self.diag(msg)
             }
         }
     }
@@ -312,6 +322,16 @@ final class CallClient: NSObject, ObservableObject {
 
     private func append(_ kind: CallEvent.Kind, _ text: String) {
         events.append(CallEvent(kind: kind, text: text, at: Date()))
+        if kind == .system {
+            diagnostics.append(text)
+            if diagnostics.count > 40 { diagnostics.removeFirst() }
+        }
+    }
+
+    /// Record a line that must outlive the call, even on failure.
+    private func diag(_ text: String) {
+        diagnostics.append(text)
+        if diagnostics.count > 40 { diagnostics.removeFirst() }
     }
 
     private func send(json: [String: Any]) {
