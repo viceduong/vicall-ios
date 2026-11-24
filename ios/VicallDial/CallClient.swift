@@ -171,12 +171,21 @@ final class CallClient: NSObject, ObservableObject {
         micWatchdog = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                if self.framesSent == 0, self.state == .inCall {
-                    let why = self.audio.captureDropReason
-                    let msg = "No microphone audio reaching the server"
-                        + (why.isEmpty ? " (tap never fired)." : ": \(why).")
-                    self.append(.system, msg)
-                    self.diag(msg)
+                guard self.state == .inCall else { return }
+                // Report the whole chain, so the next failure is localisable
+                // without another round trip: did the tap fire, did frames
+                // survive conversion, did anything play.
+                let taps = self.audio.tapFireCount
+                let why = self.audio.captureDropReason
+                let msg = "mic: taps=\(taps) sent=\(self.framesSent)"
+                    + (why.isEmpty ? "" : " dropped(\(why))")
+                    + " | playback: \(self.audio.playedBufferCount) buffers"
+                self.append(.system, msg)
+                self.diag(msg)
+                if taps == 0 {
+                    let hint = "Input tap never fired — the microphone is not "
+                        + "delivering audio to the app at all."
+                    self.append(.system, hint); self.diag(hint)
                 }
             }
         }

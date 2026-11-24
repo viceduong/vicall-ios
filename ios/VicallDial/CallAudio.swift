@@ -57,6 +57,8 @@ final class CallAudio {
     private(set) var routeInfo = ""
     /// Buffers handed to the player, so "did playback happen" is answerable.
     private(set) var playedBufferCount = 0
+    /// How many times the input tap actually fired.
+    var tapFireCount = 0
     /// Why capture frames were discarded, if they were.
     private(set) var captureDropReason = ""
     private var captureDrops = 0
@@ -131,6 +133,10 @@ final class CallAudio {
         engine = AVAudioEngine()
         player = AVAudioPlayerNode()
         voiceProcessingActive = false
+        tapFireCount = 0
+        captureDrops = 0
+        captureDropReason = ""
+        playedBufferCount = 0
         connectedFormat = nil
         playConverter = nil
         preLock.lock(); preRoll.removeAll(); preRollBytes = 0; preLock.unlock()
@@ -214,8 +220,14 @@ final class CallAudio {
             ? nil
             : AVAudioConverter(from: playFormat, to: connectFormat)
 
-        let bufferSize = AVAudioFrameCount(hwFormat.sampleRate * 0.02)
-        input.installTap(onBus: 0, bufferSize: bufferSize, format: hwFormat) { [weak self] buf, _ in
+        // installTap quietly refuses buffers below roughly 1024 frames, and at
+        // a 16kHz input 0.02s is only 320 — so the callback never fired and no
+        // microphone audio was ever captured. Pass nil for the format as well
+        // and let the node supply its own: an explicit format that disagrees
+        // with a voice-processed node is the other way this fails silently.
+        let bufferSize: AVAudioFrameCount = 4096
+        input.installTap(onBus: 0, bufferSize: bufferSize, format: nil) { [weak self] buf, _ in
+            self?.tapFireCount += 1
             self?.handleCapture(buf)
         }
 
@@ -273,11 +285,21 @@ final class CallAudio {
         // frameLength > 0 guard below dropped EVERY captured frame — the server
         // saw zero microphone audio while audio.start reported success.
         // Diagnostics from the device: "in 16kHz/1ch · out 44kHz".
-        if converter == nil, let direct = int16Data(from: buf) {
+        // The tap now supplies its own format, so decide per buffer rather
+        // than trusting what the node reported at setup time.
+        let f = buf.format
+        if f.sampleRate == targetRate && f.channelCount == 1,
+           let direct = int16Data(from: buf) {
             emit(direct)
             return
         }
-        guard let converter else { return }
+        if converter == nil || converter?.inputFormat.sampleRate != f.sampleRate {
+            converter = AVAudioConverter(from: f, to: wireFormat)
+        }
+        guard let converter else {
+            noteCaptureDrop("no converter for \(Int(f.sampleRate))Hz")
+            return
+        }
         let ratio = targetRate / buf.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 64
         guard let out = AVAudioPCMBuffer(pcmFormat: wireFormat, frameCapacity: capacity) else {
