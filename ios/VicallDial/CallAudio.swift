@@ -22,6 +22,9 @@ final class CallAudio {
     // so the server received a greeting and then zero bytes of microphone audio.
     private var engine = AVAudioEngine()
     private var player = AVAudioPlayerNode()
+    /// Silent sink that gives the input node a downstream path so the engine
+    /// actually pulls from it. Volume 0, so nothing is echoed to the caller.
+    private var captureSink = AVAudioMixerNode()
     private let targetRate: Double = 16_000
 
     /// Capture format: PCM16, mono, 16 kHz — matched to the server.
@@ -132,6 +135,7 @@ final class CallAudio {
         // Discard any previous graph before building a new one.
         engine = AVAudioEngine()
         player = AVAudioPlayerNode()
+        captureSink = AVAudioMixerNode()
         voiceProcessingActive = false
         tapFireCount = 0
         captureDrops = 0
@@ -225,6 +229,20 @@ final class CallAudio {
         // microphone audio was ever captured. Pass nil for the format as well
         // and let the node supply its own: an explicit format that disagrees
         // with a voice-processed node is the other way this fails silently.
+        // The input node must be CONNECTED into the graph, not just tapped.
+        // AVAudioEngine only pulls from an input node that has a downstream
+        // path, so a tapped-but-unconnected input never fires its callback —
+        // which is exactly what the device reported: taps=0 while playback
+        // delivered 13 buffers, because the player WAS connected to the mixer.
+        //
+        // Route it through a silenced mixer rather than straight to the main
+        // mixer: connecting the microphone to the output would send the
+        // caller's own voice back at them.
+        engine.attach(captureSink)
+        captureSink.outputVolume = 0
+        engine.connect(input, to: captureSink, format: nil)
+        engine.connect(captureSink, to: engine.mainMixerNode, format: nil)
+
         let bufferSize: AVAudioFrameCount = 4096
         input.installTap(onBus: 0, bufferSize: bufferSize, format: nil) { [weak self] buf, _ in
             self?.tapFireCount += 1
