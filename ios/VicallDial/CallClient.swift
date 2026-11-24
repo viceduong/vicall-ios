@@ -92,6 +92,19 @@ final class CallClient: NSObject, ObservableObject {
         // tunnel exposes the endpoint publicly.
         var hello: [String: Any] = ["scenario": scenario, "phone": "ios-app"]
         if !token.isEmpty { hello["token"] = token }
+        // Start audio BEFORE the hello. The server greets the moment it sees
+        // the hello frame, and play(pcm16:) drops anything that arrives while
+        // the engine is not running — which is why the first greeting was
+        // sometimes silent. Ordering it this way removes the race entirely.
+        do {
+            try audio.start()
+        } catch {
+            state = .failed(error.localizedDescription)
+            task?.cancel(with: .goingAway, reason: nil)
+            task = nil
+            return
+        }
+
         send(json: hello)
 
         framesSent = 0
@@ -140,14 +153,8 @@ final class CallClient: NSObject, ObservableObject {
             }
         }
 
-        do {
-            try audio.start()
-            state = .inCall
-            append(.system, "Connected — speak when the assistant finishes.")
-        } catch {
-            state = .failed(error.localizedDescription)
-            hangUp()
-        }
+        state = .inCall
+        append(.system, "Connected — speak when the assistant finishes.")
     }
 
     func hangUp() {

@@ -58,6 +58,11 @@ final class CallAudio {
     private let gateLock = NSLock()
     private var botSpeaking = false
 
+    /// Bot audio received before the engine was ready.
+    private let preLock = NSLock()
+    private var preRoll: [Data] = []
+    private var preRollBytes = 0
+
     func setBotSpeaking(_ speaking: Bool) {
         gateLock.lock(); botSpeaking = speaking; gateLock.unlock()
     }
@@ -82,6 +87,7 @@ final class CallAudio {
         engine = AVAudioEngine()
         player = AVAudioPlayerNode()
         voiceProcessingActive = false
+        preLock.lock(); preRoll.removeAll(); preRollBytes = 0; preLock.unlock()
 
         let session = AVAudioSession.sharedInstance()
         // No .defaultToSpeaker: routing playback to the loudspeaker while the
@@ -151,6 +157,16 @@ final class CallAudio {
         player.play()
         isRunning = true
 
+        // Flush anything the server sent while we were still starting up.
+        preLock.lock()
+        let early = preRoll
+        preRoll.removeAll()
+        preRollBytes = 0
+        preLock.unlock()
+        for chunk in early {
+            play(pcm16: chunk)
+        }
+
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleInterruption(_:)),
             name: AVAudioSession.interruptionNotification, object: nil)
@@ -214,8 +230,24 @@ final class CallAudio {
     // MARK: - playback
 
     /// Enqueue PCM16 bot audio arriving from the server.
+    ///
+    /// Audio that arrives before the engine is running is held, not dropped.
+    /// Discarding it silently is what made the opening greeting intermittently
+    /// inaudible: the server starts speaking as soon as it sees the hello
+    /// frame, and anything delivered in that window vanished.
     func play(pcm16: Data) {
-        guard isRunning, !pcm16.isEmpty else { return }
+        guard !pcm16.isEmpty else { return }
+        guard isRunning else {
+            preLock.lock()
+            // Bound it: if the engine never starts, this must not grow without
+            // limit. ~2s at 16kHz PCM16 is plenty to cover the startup window.
+            if preRollBytes < 64_000 {
+                preRoll.append(pcm16)
+                preRollBytes += pcm16.count
+            }
+            preLock.unlock()
+            return
+        }
         recLock.lock(); playedFrames.append(pcm16); recLock.unlock()
 
         let count = pcm16.count / 2
