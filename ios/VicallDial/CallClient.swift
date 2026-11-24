@@ -84,7 +84,7 @@ final class CallClient: NSObject, ObservableObject {
         partial = ""
         summary = nil
         lastResponseMs = nil
-        audio.resetRecording()
+        audio.resetForNewCall()
 
         guard let url = URL(string: urlString), url.scheme == "ws" || url.scheme == "wss" else {
             state = .failed("Bad server URL. Use wss://host/ws/call")

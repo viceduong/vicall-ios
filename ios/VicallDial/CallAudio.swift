@@ -59,6 +59,8 @@ final class CallAudio {
     private(set) var playedBufferCount = 0
     /// How many times the input tap actually fired.
     var tapFireCount = 0
+    /// Guards against a self-triggering restart loop.
+    private var restarts = 0
     /// Why capture frames were discarded, if they were.
     private(set) var captureDropReason = ""
     private var captureDrops = 0
@@ -215,8 +217,19 @@ final class CallAudio {
         // generated, sent and received, but never audible. Scheduling 16kHz
         // buffers onto a correctly-connected player is fine: AVAudioEngine
         // resamples them.
-        let mixFormat = engine.mainMixerNode.inputFormat(forBus: 0)
-        let connectFormat = mixFormat.sampleRate > 0 ? mixFormat : playFormat
+        // Match the INPUT node's rate. Voice processing requires the input
+        // node's output format and the output node's input format to be
+        // identical, so pinning playback to anything else keeps the graph
+        // illegal: the device still showed "in 48kHz · out 44kHz" and the tap
+        // still never fired. Deriving the playback format from the input rate
+        // is what finally makes both halves agree.
+        let graphRate = hwFormat.sampleRate > 0
+            ? hwFormat.sampleRate
+            : engine.mainMixerNode.inputFormat(forBus: 0).sampleRate
+        let connectFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                          sampleRate: graphRate,
+                                          channels: 1,
+                                          interleaved: false) ?? playFormat
         engine.connect(player, to: engine.mainMixerNode, format: connectFormat)
         connectedFormat = connectFormat
         // Convert explicitly rather than trusting the engine to resample a
@@ -287,9 +300,11 @@ final class CallAudio {
         // The engine stops itself when the hardware rate or channel count
         // changes, and connection formats in an input chain must follow the
         // hardware. Without this the call simply goes dead mid-conversation.
+        NotificationCenter.default.removeObserver(
+            self, name: .AVAudioEngineConfigurationChange, object: nil)
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleConfigChange(_:)),
-            name: .AVAudioEngineConfigurationChange, object: engine)
+            name: .AVAudioEngineConfigurationChange, object: nil)
     }
 
     func stop() {
@@ -489,6 +504,12 @@ final class CallAudio {
             .write(to: url)
     }
 
+    /// Called by the client when a new call begins.
+    func resetForNewCall() {
+        restarts = 0
+        resetRecording()
+    }
+
     func resetRecording() {
         recLock.lock(); capturedFrames.removeAll(); playedFrames.removeAll(); recLock.unlock()
     }
@@ -519,13 +540,16 @@ final class CallAudio {
 
     @objc private func handleConfigChange(_ note: Notification) {
         guard isRunning else { return }
-        onError?("Audio route changed — restarting capture.")
-        let wasRunning = isRunning
+        // start() builds a NEW engine and re-registers this observer, so a
+        // naive restart here re-triggers itself forever — the device logged
+        // dozens of "route changed" lines and ended with a dead graph. Restart
+        // at most twice, and only when the engine really stopped.
+        guard restarts < 2, !engine.isRunning else { return }
+        restarts += 1
+        onError?("Audio route changed — restarting capture (\(restarts)).")
         stop()
-        if wasRunning {
-            do { try start() } catch {
-                onError?("Could not restart audio: \(error.localizedDescription)")
-            }
+        do { try start() } catch {
+            onError?("Could not restart audio: \(error.localizedDescription)")
         }
     }
 
