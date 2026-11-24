@@ -57,6 +57,16 @@ final class CallAudio {
     private(set) var routeInfo = ""
     /// Buffers handed to the player, so "did playback happen" is answerable.
     private(set) var playedBufferCount = 0
+    /// Why capture frames were discarded, if they were.
+    private(set) var captureDropReason = ""
+    private var captureDrops = 0
+
+    private func noteCaptureDrop(_ why: String) {
+        captureDrops += 1
+        if captureDrops == 1 || captureDrops % 200 == 0 {
+            captureDropReason = "\(why) (x\(captureDrops))"
+        }
+    }
 
     /// Suppress the uplink while the bot is speaking.
     ///
@@ -178,7 +188,12 @@ final class CallAudio {
                     + "no other app is using it, then try again.",
             ])
         }
-        converter = AVAudioConverter(from: hwFormat, to: wireFormat)
+        // nil means "formats already match, pass frames through untouched".
+        converter = (hwFormat.sampleRate == wireFormat.sampleRate
+                     && hwFormat.channelCount == wireFormat.channelCount
+                     && hwFormat.commonFormat == .pcmFormatInt16)
+            ? nil
+            : AVAudioConverter(from: hwFormat, to: wireFormat)
 
         engine.attach(player)
         // Connect with the MIXER's own format, not our 16kHz wire format.
@@ -252,6 +267,16 @@ final class CallAudio {
     // MARK: - capture
 
     private func handleCapture(_ buf: AVAudioPCMBuffer) {
+        // Voice processing puts the input node at 16kHz, which is already our
+        // wire format. An AVAudioConverter between identical formats is an
+        // identity pass and returns 0 frames through the pull-block API, so the
+        // frameLength > 0 guard below dropped EVERY captured frame — the server
+        // saw zero microphone audio while audio.start reported success.
+        // Diagnostics from the device: "in 16kHz/1ch · out 44kHz".
+        if converter == nil, let direct = int16Data(from: buf) {
+            emit(direct)
+            return
+        }
         guard let converter else { return }
         let ratio = targetRate / buf.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 64
@@ -270,19 +295,44 @@ final class CallAudio {
             status.pointee = .haveData
             return buf
         }
-        if err != nil { return }
+        if err != nil {
+            noteCaptureDrop("converter error")
+            return
+        }
 
-        guard let ch = out.int16ChannelData, out.frameLength > 0 else { return }
-        let bytes = Int(out.frameLength) * 2
-        var data = Data(bytes: ch[0], count: bytes)
+        guard let ch = out.int16ChannelData, out.frameLength > 0 else {
+            // Never fail silently here again: a converter yielding 0 frames is
+            // exactly how the microphone went dead while start() reported OK.
+            noteCaptureDrop("converter produced 0 frames")
+            return
+        }
+        emit(Data(bytes: ch[0], count: Int(out.frameLength) * 2))
+    }
 
+    /// Read a PCM16 buffer straight out, no conversion.
+    private func int16Data(from buf: AVAudioPCMBuffer) -> Data? {
+        guard buf.frameLength > 0 else { return nil }
+        if let ch = buf.int16ChannelData {
+            return Data(bytes: ch[0], count: Int(buf.frameLength) * 2)
+        }
+        // Voice processing can hand back float frames at the right rate.
+        guard let fl = buf.floatChannelData else { return nil }
+        let n = Int(buf.frameLength)
+        var pcm = [Int16](repeating: 0, count: n)
+        for i in 0..<n {
+            pcm[i] = Int16(max(-32768, min(32767, fl[0][i] * 32767)))
+        }
+        return pcm.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+
+    private func emit(_ frame: Data) {
+        var data = frame
         // Without AEC, replace the bot's own bleed with silence instead of
         // dropping the frame: the server's VAD needs a continuous stream to
         // time its endpointing, and gaps read as the caller having stopped.
         if shouldMuteUplink {
-            data = Data(count: bytes)
+            data = Data(count: frame.count)
         }
-
         recLock.lock(); capturedFrames.append(data); recLock.unlock()
         onFrame?(data)
     }

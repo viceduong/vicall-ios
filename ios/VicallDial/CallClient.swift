@@ -172,9 +172,11 @@ final class CallClient: NSObject, ObservableObject {
             guard let self else { return }
             Task { @MainActor in
                 if self.framesSent == 0, self.state == .inCall {
-                    self.append(.system,
-                                "No microphone audio is reaching the server. "
-                                + "Hang up and redial.")
+                    let why = self.audio.captureDropReason
+                    let msg = "No microphone audio reaching the server"
+                        + (why.isEmpty ? " (tap never fired)." : ": \(why).")
+                    self.append(.system, msg)
+                    self.diag(msg)
                 }
             }
         }
