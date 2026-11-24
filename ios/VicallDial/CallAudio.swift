@@ -16,12 +16,16 @@ final class CallAudio {
     /// Raised when audio cannot continue (route loss, interruption).
     var onError: ((String) -> Void)?
 
-    // Rebuilt for every call. Reusing one engine across calls left the input
-    // silently dead on a second dial — attaching the same player node again and
-    // re-tapping a stale input produced a graph that ran but captured nothing,
-    // so the server received a greeting and then zero bytes of microphone audio.
-    private var engine = AVAudioEngine()
-    private var player = AVAudioPlayerNode()
+    // ONE engine for the lifetime of this object, as in the first working
+    // version. Recreating it per call is what actually broke capture: the app
+    // captured audio fine until that change (calls of 44s and 41s with real
+    // turns are in the records), and never again afterwards. The theory it was
+    // meant to fix — a stale graph on redial — was wrong, and rebuilding the
+    // engine inside start() instead left the tap attached to a node the running
+    // engine no longer owned. Nine subsequent theories were all downstream of
+    // this one regression.
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
     private let targetRate: Double = 16_000
 
     /// Capture format: PCM16, mono, 16 kHz — matched to the server.
@@ -134,9 +138,13 @@ final class CallAudio {
             ])
         }
 
-        // Discard any previous graph before building a new one.
-        engine = AVAudioEngine()
-        player = AVAudioPlayerNode()
+        // Reset the graph in place rather than replacing the engine. Detaching
+        // the player clears the previous connection so the reconnect below is
+        // clean, which is what the per-call rebuild was really trying to do.
+        if engine.attachedNodes.contains(player) {
+            engine.detach(player)
+        }
+        engine.inputNode.removeTap(onBus: 0)
         voiceProcessingActive = false
         tapFireCount = 0
         captureDrops = 0
