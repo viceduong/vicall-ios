@@ -16,8 +16,12 @@ final class CallAudio {
     /// Raised when audio cannot continue (route loss, interruption).
     var onError: ((String) -> Void)?
 
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    // Rebuilt for every call. Reusing one engine across calls left the input
+    // silently dead on a second dial — attaching the same player node again and
+    // re-tapping a stale input produced a graph that ran but captured nothing,
+    // so the server received a greeting and then zero bytes of microphone audio.
+    private var engine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
     private let targetRate: Double = 16_000
 
     /// Capture format: PCM16, mono, 16 kHz — matched to the server.
@@ -74,6 +78,11 @@ final class CallAudio {
     func start() throws {
         guard !isRunning else { return }
 
+        // Discard any previous graph before building a new one.
+        engine = AVAudioEngine()
+        player = AVAudioPlayerNode()
+        voiceProcessingActive = false
+
         let session = AVAudioSession.sharedInstance()
         // No .defaultToSpeaker: routing playback to the loudspeaker while the
         // microphone is live is what makes echo audible in the first place.
@@ -109,10 +118,22 @@ final class CallAudio {
 
         // Read the format AFTER enabling voice processing: turning it on can
         // change the node's channel count and sample rate.
-        let hwFormat = input.outputFormat(forBus: 0)
-        guard hwFormat.sampleRate > 0 else {
+        //
+        // The route is not always ready the instant setActive returns, and a
+        // 0 Hz format yields a tap that never fires. Retry briefly rather than
+        // starting a call whose microphone is dead.
+        var hwFormat = input.outputFormat(forBus: 0)
+        var waited = 0.0
+        while hwFormat.sampleRate <= 0 && waited < 1.0 {
+            Thread.sleep(forTimeInterval: 0.05)
+            waited += 0.05
+            hwFormat = input.outputFormat(forBus: 0)
+        }
+        guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
             throw NSError(domain: "CallAudio", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Microphone unavailable. Check permissions.",
+                NSLocalizedDescriptionKey:
+                    "Microphone unavailable — check the mic permission and that "
+                    + "no other app is using it, then try again.",
             ])
         }
         converter = AVAudioConverter(from: hwFormat, to: wireFormat)

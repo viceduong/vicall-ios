@@ -44,6 +44,9 @@ final class CallClient: NSObject, ObservableObject {
     private var session: URLSession?
     /// Keeps the tunnel from treating a quiet call as a dead connection.
     private var heartbeat: Timer?
+    /// Catches a microphone that starts but never delivers audio.
+    private var micWatchdog: Timer?
+    private var framesSent = 0
     private let audio = CallAudio()
     private var scenario = "screening"
 
@@ -84,8 +87,11 @@ final class CallClient: NSObject, ObservableObject {
         if !token.isEmpty { hello["token"] = token }
         send(json: hello)
 
+        framesSent = 0
         audio.onFrame = { [weak self] data in
-            self?.task?.send(.data(data)) { _ in }
+            guard let self else { return }
+            self.task?.send(.data(data)) { _ in }
+            Task { @MainActor in self.framesSent += 1 }
         }
         audio.onError = { [weak self] msg in
             Task { @MainActor in self?.append(.system, msg) }
@@ -96,6 +102,21 @@ final class CallClient: NSObject, ObservableObject {
         heartbeat?.invalidate()
         heartbeat = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             self?.task?.sendPing { _ in }
+        }
+
+        // A silently dead microphone used to look like a network problem: the
+        // server played its greeting, received zero audio, and ended the call
+        // after the no-input timeout. Detect it here and say so.
+        micWatchdog?.invalidate()
+        micWatchdog = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                if self.framesSent == 0, self.state == .inCall {
+                    self.append(.system,
+                                "No microphone audio is reaching the server. "
+                                + "Hang up and redial.")
+                }
+            }
         }
 
         do {
@@ -112,6 +133,7 @@ final class CallClient: NSObject, ObservableObject {
         guard state == .inCall || state == .connecting else { return }
         state = .ending
         heartbeat?.invalidate(); heartbeat = nil
+        micWatchdog?.invalidate(); micWatchdog = nil
         send(json: ["type": "hangup"])
         audio.stop()
         // Persist locally even if the server summary never arrives.
@@ -138,6 +160,7 @@ final class CallClient: NSObject, ObservableObject {
                     // A cancel during hangup is expected, not a failure.
                     if self.state == .inCall || self.state == .connecting {
                         self.heartbeat?.invalidate(); self.heartbeat = nil
+                        self.micWatchdog?.invalidate(); self.micWatchdog = nil
                         self.saveRecording()  // keep what we captured
                         self.state = .failed("Connection dropped: \(err.localizedDescription)")
                         self.audio.stop()
@@ -264,6 +287,7 @@ extension CallClient: URLSessionWebSocketDelegate {
                                 reason: Data?) {
         Task { @MainActor in
             self.heartbeat?.invalidate(); self.heartbeat = nil
+            self.micWatchdog?.invalidate(); self.micWatchdog = nil
             self.audio.stop()
             if self.state == .inCall {
                 // Server-initiated close mid-call: surface it rather than
