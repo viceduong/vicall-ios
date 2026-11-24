@@ -57,6 +57,24 @@ final class CallClient: NSObject, ObservableObject {
 
     func dial(urlString: String, scenario: String, token: String = "") {
         guard state == .idle || isFailed else { return }
+        // Settle the microphone permission before opening the socket, so a
+        // first run cannot start a call whose audio graph is dead.
+        Task { [weak self] in
+            let ok = await CallAudio.requestMic()
+            await MainActor.run {
+                guard let self else { return }
+                if ok {
+                    self.reallyDial(urlString: urlString, scenario: scenario, token: token)
+                } else {
+                    self.state = .failed(
+                        "Microphone access denied. Open Settings > Vicall and "
+                        + "enable Microphone.")
+                }
+            }
+        }
+    }
+
+    private func reallyDial(urlString: String, scenario: String, token: String) {
         self.scenario = scenario
         events.removeAll()
         partial = ""

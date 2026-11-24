@@ -93,8 +93,29 @@ final class CallAudio {
 
     // MARK: - lifecycle
 
+    /// Microphone authorisation, awaited rather than fired and forgotten.
+    static func requestMic() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: return true
+        case .notDetermined: return await AVCaptureDevice.requestAccess(for: .audio)
+        default: return false
+        }
+    }
+
     func start() throws {
         guard !isRunning else { return }
+
+        // Without this the whole graph comes up dead: touching inputNode
+        // unauthorised leaves it misconfigured, so neither capture nor playback
+        // works and nothing raises. That presented as a silent greeting AND as
+        // zero microphone frames reaching the server — one fault, not two.
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            throw NSError(domain: "CallAudio", code: 2, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Microphone access is not granted. Open Settings > Vicall "
+                    + "and enable Microphone, then dial again.",
+            ])
+        }
 
         // Discard any previous graph before building a new one.
         engine = AVAudioEngine()
