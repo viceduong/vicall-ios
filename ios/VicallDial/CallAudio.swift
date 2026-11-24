@@ -41,9 +41,22 @@ final class CallAudio {
     }()
 
     private var converter: AVAudioConverter?
+    /// Format the player node is actually connected with.
+    private var connectedFormat: AVAudioFormat?
+    /// 16kHz wire audio -> whatever the graph wants.
+    private var playConverter: AVAudioConverter?
     private(set) var isRunning = false
     /// True when the hardware echo canceller engaged.
     private(set) var voiceProcessingActive = false
+
+    /// One-line summary of the live audio graph, shown in-call.
+    ///
+    /// Three rounds were spent on a silent greeting that turned out to be a
+    /// format mismatch. Surfacing the actual rates means the next audio fault
+    /// is visible on the phone instead of inferred from server logs.
+    private(set) var routeInfo = ""
+    /// Buffers handed to the player, so "did playback happen" is answerable.
+    private(set) var playedBufferCount = 0
 
     /// Suppress the uplink while the bot is speaking.
     ///
@@ -87,6 +100,8 @@ final class CallAudio {
         engine = AVAudioEngine()
         player = AVAudioPlayerNode()
         voiceProcessingActive = false
+        connectedFormat = nil
+        playConverter = nil
         preLock.lock(); preRoll.removeAll(); preRollBytes = 0; preLock.unlock()
 
         let session = AVAudioSession.sharedInstance()
@@ -145,7 +160,23 @@ final class CallAudio {
         converter = AVAudioConverter(from: hwFormat, to: wireFormat)
 
         engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: playFormat)
+        // Connect with the MIXER's own format, not our 16kHz wire format.
+        // Enabling voice processing on the output node forces the graph to the
+        // hardware rate (typically 48kHz), and connecting a 16kHz format onto
+        // that mismatched node produced silent playback — the greeting was
+        // generated, sent and received, but never audible. Scheduling 16kHz
+        // buffers onto a correctly-connected player is fine: AVAudioEngine
+        // resamples them.
+        let mixFormat = engine.mainMixerNode.inputFormat(forBus: 0)
+        let connectFormat = mixFormat.sampleRate > 0 ? mixFormat : playFormat
+        engine.connect(player, to: engine.mainMixerNode, format: connectFormat)
+        connectedFormat = connectFormat
+        // Convert explicitly rather than trusting the engine to resample a
+        // mismatched buffer: a silent graph is far harder to notice than a
+        // conversion error.
+        playConverter = connectFormat.sampleRate == playFormat.sampleRate
+            ? nil
+            : AVAudioConverter(from: playFormat, to: connectFormat)
 
         let bufferSize = AVAudioFrameCount(hwFormat.sampleRate * 0.02)
         input.installTap(onBus: 0, bufferSize: bufferSize, format: hwFormat) { [weak self] buf, _ in
@@ -156,6 +187,14 @@ final class CallAudio {
         try engine.start()
         player.play()
         isRunning = true
+
+        let sess = AVAudioSession.sharedInstance()
+        routeInfo = String(
+            format: "in %.0fkHz/%dch · out %.0fkHz · aec %@ · %@",
+            hwFormat.sampleRate / 1000, Int(hwFormat.channelCount),
+            connectFormat.sampleRate / 1000,
+            voiceProcessingActive ? "on" : "OFF",
+            sess.currentRoute.outputs.first?.portType.rawValue ?? "?")
 
         // Flush anything the server sent while we were still starting up.
         preLock.lock()
@@ -262,7 +301,30 @@ final class CallAudio {
                 dst[0][i] = Float(src[i]) / 32768.0
             }
         }
-        player.scheduleBuffer(buf, completionHandler: nil)
+        guard let out = convertForPlayback(buf) else { return }
+        playedBufferCount += 1
+        player.scheduleBuffer(out, completionHandler: nil)
+    }
+
+    /// Resample a 16kHz buffer to the connected format when they differ.
+    private func convertForPlayback(_ buf: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let conv = playConverter, let target = connectedFormat else {
+            return buf  // formats already match
+        }
+        let ratio = target.sampleRate / playFormat.sampleRate
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 64
+        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: cap) else {
+            return nil
+        }
+        var done = false
+        var err: NSError?
+        conv.convert(to: out, error: &err) { _, status in
+            if done { status.pointee = .noDataNow; return nil }
+            done = true
+            status.pointee = .haveData
+            return buf
+        }
+        return err == nil && out.frameLength > 0 ? out : nil
     }
 
     /// Drop anything still queued — used when the caller interrupts the bot.

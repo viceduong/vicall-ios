@@ -155,6 +155,21 @@ final class CallClient: NSObject, ObservableObject {
 
         state = .inCall
         append(.system, "Connected — speak when the assistant finishes.")
+        if !audio.routeInfo.isEmpty { append(.system, audio.routeInfo) }
+
+        // Report whether bot audio actually reached the player. A silent
+        // greeting with a healthy server looks identical to a failed one from
+        // the app, so state it explicitly.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            await MainActor.run {
+                guard let self, self.state == .inCall else { return }
+                let n = self.audio.playedBufferCount
+                self.append(.system, n == 0
+                    ? "No bot audio reached the speaker (0 buffers) — audio graph problem."
+                    : "Playback OK (\(n) buffers).")
+            }
+        }
     }
 
     func hangUp() {
